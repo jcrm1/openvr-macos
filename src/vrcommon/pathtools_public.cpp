@@ -1,6 +1,6 @@
 //========= Copyright Valve Corporation ============//
-#include "strtools_public.h"
-#include "pathtools_public.h"
+#include <vrcore/strtools_public.h>
+#include <vrcore/pathtools_public.h>
 
 #if defined( _WIN32)
 #include <windows.h>
@@ -16,7 +16,9 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <alloca.h>
 #endif
+
 #if defined OSX
 #include <Foundation/Foundation.h>
 #include <AppKit/AppKit.h>
@@ -95,6 +97,24 @@ bool Path_SetWorkingDirectory( const std::string & sPath )
 	bSuccess = 0 == chdir( sPath.c_str() );
 #endif
 	return bSuccess;
+}
+
+/** Gets the path to a temporary directory. */
+std::string Path_GetTemporaryDirectory()
+{
+#if defined( _WIN32 )
+	wchar_t buf[MAX_UNICODE_PATH];
+	if ( GetTempPathW( MAX_UNICODE_PATH, buf ) == 0 )
+		return Path_GetWorkingDirectory();
+	return UTF16to8( buf );
+#else
+	const char *pchTmpDir = getenv( "TMPDIR" );
+	if ( pchTmpDir == NULL )
+	{
+		return "";
+	}
+	return pchTmpDir;
+#endif
 }
 
 /** Returns the specified path without its filename */
@@ -191,7 +211,7 @@ bool Path_IsAbsolute( const std::string & sPath )
 std::string Path_MakeAbsolute( const std::string & sRelativePath, const std::string & sBasePath )
 {
 	if( Path_IsAbsolute( sRelativePath ) )
-		return sRelativePath;
+		return Path_Compact( sRelativePath );
 	else
 	{
 		if( !Path_IsAbsolute( sBasePath ) )
@@ -341,8 +361,9 @@ std::string Path_Compact( const std::string & sRawPath, char slash )
 		std::string::size_type len = sPath.length();
 		if( sPath[ len-1 ] == '.'  && sPath[ len-2 ] == slash )
 		{
-		  // sPath.pop_back();
-		  sPath[len-1] = 0;  // for now, at least
+			sPath.pop_back();
+			//Not sure why the following line of code was used for a while.  It causes problems with strlen.
+			//sPath[len-1] = 0;  // for now, at least 
 		}
 	}
 
@@ -388,6 +409,20 @@ std::string Path_Compact( const std::string & sRawPath, char slash )
 	}
 
 	return sPath;
+}
+
+
+/** Returns true if these two paths are the same without respect for internal . or ..
+* sequences, slash type, or case (on case-insensitive platforms). */
+bool Path_IsSamePath( const std::string & sPath1, const std::string & sPath2 )
+{
+	std::string sCompact1 = Path_Compact( sPath1 );
+	std::string sCompact2 = Path_Compact( sPath2 );
+#if defined(WIN32)
+	return !stricmp( sCompact1.c_str(), sCompact2.c_str() );
+#else
+	return !strcmp( sCompact1.c_str(), sCompact2.c_str() );
+#endif
 }
 
 
@@ -556,6 +591,41 @@ std::string Path_FindParentSubDirectoryRecursively( const std::string &strStartD
 //-----------------------------------------------------------------------------
 // Purpose: reading and writing files in the vortex directory
 //-----------------------------------------------------------------------------
+std::vector<uint8_t> Path_ReadBinaryFile( const std::string & strFilename )
+{
+	FILE *f;
+#if defined( POSIX )
+	f = fopen( strFilename.c_str(), "rb" );
+#else
+	std::wstring wstrFilename = UTF8to16( strFilename.c_str() );
+	// the open operation needs to be sharable, therefore use of _wfsopen instead of _wfopen_s
+	f = _wfsopen( wstrFilename.c_str(), L"rb", _SH_DENYNO );
+#endif
+
+	std::vector<uint8_t> vecFileContents;
+
+	if ( f != NULL )
+	{
+		fseek( f, 0, SEEK_END );
+		int size = ftell( f );
+		fseek( f, 0, SEEK_SET );
+
+		vecFileContents.resize( size );
+		if ( fread( &vecFileContents[ 0 ], size, 1, f ) == 1 )
+		{
+		}
+		else
+		{
+			vecFileContents.clear();
+		}
+
+		fclose( f );
+	}
+
+	return vecFileContents ;
+}
+
+
 unsigned char * Path_ReadBinaryFile( const std::string &strFilename, int *pSize )
 {
 	FILE *f;
@@ -682,6 +752,28 @@ std::string Path_ReadTextFile( const std::string &strFilename )
 }
 
 
+bool Path_MakeWritable( const std::string &strFilename )
+{
+#if defined ( _WIN32 )
+	std::wstring wstrFilename = UTF8to16( strFilename.c_str() );
+
+	DWORD dwAttrs = GetFileAttributesW( wstrFilename.c_str() );
+	if ( dwAttrs != INVALID_FILE_ATTRIBUTES && ( dwAttrs & FILE_ATTRIBUTE_READONLY ) )
+	{
+		return SetFileAttributesW( wstrFilename.c_str(), dwAttrs & ~FILE_ATTRIBUTE_READONLY );
+	}
+#else
+	struct stat sb;
+
+	if ( stat( strFilename.c_str(), &sb ) == 0 && !( sb.st_mode & S_IWUSR ) )
+	{
+		return ( chmod( strFilename.c_str(), sb.st_mode | S_IWUSR ) == 0 );
+	}
+#endif
+
+	return true;
+}
+
 bool Path_WriteStringToTextFile( const std::string &strFilename, const char *pchData )
 {
 	FILE *f;
@@ -760,7 +852,12 @@ std::string Path_FilePathToUrl( const std::string & sRelativePath, const std::st
 		if ( sAbsolute.empty() )
 			return sAbsolute;
 		sAbsolute = Path_FixSlashes( sAbsolute, '/' );
-		return std::string( FILE_URL_PREFIX ) + sAbsolute;
+
+		size_t unBufferSize = sAbsolute.length() * 3;
+		char *pchBuffer = (char *)alloca( unBufferSize );
+		V_URLEncodeFullPath( pchBuffer, (int)unBufferSize, sAbsolute.c_str(), (int)sAbsolute.length() );
+
+		return std::string( FILE_URL_PREFIX ) + pchBuffer;
 	}
 }
 
@@ -771,9 +868,11 @@ std::string Path_UrlToFilePath( const std::string & sFileUrl )
 {
 	if ( !strnicmp( sFileUrl.c_str(), FILE_URL_PREFIX, strlen( FILE_URL_PREFIX ) ) )
 	{
-		std::string sRet = sFileUrl.c_str() + strlen( FILE_URL_PREFIX );
-		sRet = Path_FixSlashes( sRet );
-		return sRet;
+		char *pchBuffer = (char *)alloca( sFileUrl.length() );
+		V_URLDecodeNoPlusForSpace( pchBuffer, (int)sFileUrl.length(), 
+			sFileUrl.c_str() + strlen( FILE_URL_PREFIX ), (int)( sFileUrl.length() - strlen( FILE_URL_PREFIX ) ) );
+
+		return Path_FixSlashes( pchBuffer );
 	}
 	else
 	{
@@ -820,3 +919,70 @@ std::string GetUserDocumentsPath()
 #endif
 }
 
+
+// -----------------------------------------------------------------------------------------------------
+// Purpose: deletes / unlinks a single file
+// -----------------------------------------------------------------------------------------------------
+bool Path_UnlinkFile( const std::string &strFilename )
+{
+#if defined( WIN32 )
+	std::wstring wsFilename = UTF8to16( strFilename.c_str() );
+	return ( 0 != DeleteFileW( wsFilename.c_str() ) );
+#else
+	return ( 0 == unlink( strFilename.c_str() ) );
+#endif
+}
+
+
+// -----------------------------------------------------------------------------------------------------
+// Limits the set of characters that are allowed in filenames
+// -----------------------------------------------------------------------------------------------------
+std::string Path_SanitizeFilename( const std::string& sFilename )
+{
+	std::string sFixed = sFilename;
+	std::string::iterator iLastDot = sFixed.end();
+	for ( std::string::iterator i = sFixed.begin(); i != sFixed.end(); i++ )
+	{
+		if ( *i == '.' )
+		{
+			iLastDot = i;
+		}
+
+		// path-related characters are forbidden (except the last period)
+		switch ( *i )
+		{
+			case '\0':
+			case '.':
+			case '\\':
+			case '/':
+			case ':':
+			case '|':
+			case '?':
+			case '>':
+			case '<':
+			case '&':
+			case '%':
+			case '@':
+			case '$':
+			case '*':
+			case '\"':
+				*i = '_';
+				break;
+
+			default:
+				if ( *i < 32 )
+				{
+					*i = '_';
+				}
+				break;
+		}
+	}
+
+	if ( iLastDot != sFixed.end() && iLastDot != sFixed.begin() 
+		&& iLastDot+1 != sFixed.end() )
+	{
+		*iLastDot = '.';
+	}
+
+	return sFixed;
+}
